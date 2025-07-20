@@ -4,6 +4,11 @@
 check_host() { ping -c 2 "$1" &> /dev/null; return $?; }
 get_safe_name() { echo "$1" | sed 's/[^a-zA-Z0-9_-]/_/g'; }
 
+# Функция для получения пароля sudo через графический интерфейс
+get_sudo_password() {
+    zenity --password --title="Требуются права администратора" --text="Введите ваш пароль sudo:" 2>/dev/null
+}
+
 create_credentials() {
     local credentials_file="$1"
     local username
@@ -20,17 +25,24 @@ EOF
     chmod 600 "$credentials_file"
 }
 
-# Объединённый диалог ввода хоста и имени папки
-HOST_DATA=$(zenity --width=800 --height=200 --forms --title="Подключение к SMB" \
+# Объединённый диалог ввода
+AUTH_DATA=$(zenity --width=800 --height=300 --forms --title="Подключение к SMB" \
     --text="Введите параметры подключения" \
     --add-entry="IP-адрес или hostname сервера:" \
-    --add-entry="Имя папки для монтирования (необязательно):")
+    --add-entry="Имя папки для монтирования:" "smbshares" \
+    --add-combo="Метод авторизации:" \
+    --combo-values="Existing .cifs|New credentials|Manual login" \
+    --add-entry="Имя пользователя (если Manual):" \
+    --add-password="Пароль (если Manual):")
 
-[ -z "$HOST_DATA" ] && exit 0
+[ -z "$AUTH_DATA" ] && exit 0
 
 # Разбираем введённые данные
-REMOTE_HOST=$(echo "$HOST_DATA" | cut -d'|' -f1)
-MOUNT_BASE_DIR=$(echo "$HOST_DATA" | cut -d'|' -f2)
+REMOTE_HOST=$(echo "$AUTH_DATA" | cut -d'|' -f1)
+MOUNT_BASE_DIR=$(echo "$AUTH_DATA" | cut -d'|' -f2)
+AUTH_METHOD=$(echo "$AUTH_DATA" | cut -d'|' -f3)
+MANUAL_USER=$(echo "$AUTH_DATA" | cut -d'|' -f4)
+MANUAL_PASS=$(echo "$AUTH_DATA" | cut -d'|' -f5)
 
 # Проверка хоста
 if ! check_host "$REMOTE_HOST"; then
@@ -38,29 +50,33 @@ if ! check_host "$REMOTE_HOST"; then
     exit 1
 fi
 
-# Установка имени папки по умолчанию
-[ -z "$MOUNT_BASE_DIR" ] && MOUNT_BASE_DIR=$(get_safe_name "$REMOTE_HOST")
-
-# Авторизация
-AUTH_METHOD=$(zenity --width=400 --height=400 --list --title="SMB Auth" \
-    --column="Method" --column="Description" \
-    "Existing" "Использовать ~/.cifs" \
-    "New" "Создать файл credentials" \
-    "Manual" "Ввести логин/пароль") || exit 1
-
+# Обработка авторизации
 case "$AUTH_METHOD" in
-    "Existing")
+    "Existing .cifs")
         CREDENTIALS="$HOME/.cifs"
-        [ ! -f "$CREDENTIALS" ] && { zenity --question --text="Файл не найден. Создать?" && create_credentials "$CREDENTIALS" || exit 1; }
+        [ ! -f "$CREDENTIALS" ] && {
+            zenity --question --text="Файл $CREDENTIALS не найден. Создать?" &&
+            create_credentials "$CREDENTIALS" || exit 1
+        }
         ;;
-    "New")
+    "New credentials")
         CREDENTIALS="$HOME/.${MOUNT_BASE_DIR}-credentials"
-        [ -f "$CREDENTIALS" ] && { zenity --question --text="Перезаписать файл?" || exit 1; }
+        [ -f "$CREDENTIALS" ] && {
+            zenity --question --text="Файл $CREDENTIALS существует. Перезаписать?" || exit 1
+        }
         create_credentials "$CREDENTIALS" || exit 1
         ;;
-    "Manual")
-        USERNAME=$(zenity --entry --title="SMB Auth" --text="Введите имя пользователя:") || exit 1
-        PASSWORD=$(zenity --password --title="SMB Auth" --text="Введите пароль:") || exit 1
+    "Manual login")
+        [ -z "$MANUAL_USER" ] && {
+            zenity --error --text="Имя пользователя не может быть пустым!"
+            exit 1
+        }
+        [ -z "$MANUAL_PASS" ] && {
+            zenity --error --text="Пароль не может быть пустым!"
+            exit 1
+        }
+        USERNAME="$MANUAL_USER"
+        PASSWORD="$MANUAL_PASS"
         CREDENTIALS=""
         ;;
     *) exit 1 ;;
@@ -104,6 +120,10 @@ REPORT="Результаты монтирования:\n\n"
 MOUNT_SUCCESS=0
 MOUNT_FAILED=0
 
+# Получаем пароль sudo один раз
+SUDO_PASSWORD=$(get_sudo_password)
+[ -z "$SUDO_PASSWORD" ] && exit 1
+
 # Монтирование всех выбранных шар
 for share in "${ALL_SHARES[@]}"; do
     share_dir="$MOUNT_DIR/$(get_safe_name "$share")"
@@ -121,16 +141,20 @@ for share in "${ALL_SHARES[@]}"; do
         continue
     fi
 
-    # Попытка монтирования
+    # Попытка монтирования через udisksctl (без sudo)
     if udisksctl mount -t cifs -b "//$REMOTE_HOST/$share" -o "$mount_options" >/dev/null 2>&1; then
         REPORT+="✅ Успешно: $share → $share_dir\n"
         ((MOUNT_SUCCESS++))
-    elif sudo mount.cifs "//$REMOTE_HOST/$share" "$share_dir" -o "$mount_options"; then
-        REPORT+="✅ Успешно: $share → $share_dir (через sudo)\n"
-        ((MOUNT_SUCCESS++))
     else
-        REPORT+="❌ Ошибка: $share\n"
-        ((MOUNT_FAILED++))
+        # Монтирование через sudo с графическим вводом пароля
+        echo "$SUDO_PASSWORD" | sudo -S mount.cifs "//$REMOTE_HOST/$share" "$share_dir" -o "$mount_options" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            REPORT+="✅ Успешно: $share → $share_dir (через sudo)\n"
+            ((MOUNT_SUCCESS++))
+        else
+            REPORT+="❌ Ошибка: $share\n"
+            ((MOUNT_FAILED++))
+        fi
     fi
 done
 
